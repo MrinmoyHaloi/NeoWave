@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=NeoWave
+Comment=Desktop music player — YouTube Music, Last.fm scrobbling
+Exec=/opt/neowave/neowave
+Icon=neowave
+Terminal=false
+Type=Application
+Categories=Audio;Music;AudioVideo;
+StartupWMClass=neowave
