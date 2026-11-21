@@ -1,0 +1,6 @@
+{
+    "editor.formatOnSave": false,
+    "terminal.integrated.fontFamily": "MesloLGL Nerd Font Mono",
+    "terminal.integrated.fontSize": 12,
+    "terminal.integrated.fontWeight": "600"
+}

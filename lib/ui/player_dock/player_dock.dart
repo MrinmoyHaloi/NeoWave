@@ -1,0 +1,1431 @@
+import 'dart:io';
+
+import 'package:audio_video_progress_bar/audio_video_progress_bar.dart' as avp;
+import 'package:fluent_ui/fluent_ui.dart' hide RepeatMode;
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../core/audio/stream_models.dart';
+import '../../features/downloads/download_manager.dart';
+import '../../features/library/playlists.dart';
+import '../../features/player/playback_service.dart';
+import '../../features/audio_output/output_controller.dart';
+import '../components/inputs.dart';
+import '../components/ambient.dart';
+import '../components/artist_line.dart';
+import '../components/artwork.dart';
+import '../components/buttons.dart' show NWTooltip, NWVolumeSlider, WaveA11yButton, WaveLink;
+import '../components/menus.dart';
+import '../theme/haze.dart';
+import '../theme/tokens.dart';
+import '../theme/wave_icons.dart';
+
+/// Coherent desktop music player — ONE object, 80px, three zones.
+///
+/// LEFT (290px): 56px artwork r6 + title 13.5/600 + artist 12 secondary +
+/// like + more (truncate). CENTER (max 560): shuffle/prev/play/next/repeat
+/// 18px + 3px timeline + tabular 11px timestamps. RIGHT (300px): quality
+/// overline badge + lyrics + queue + output + 84px volume + expand +
+/// overflow (speed/sleep/download/Open Now Playing).
+///
+/// Always visible — placeholder when nothing is playing, never collapses.
+/// Position ticks are scoped to [_DockProgress] only via
+/// `select((s) => position/buffered/duration)`; the shell never rebuilds.
+class WavePlayerDock extends ConsumerWidget {
+  final VoidCallback onExpand;
+  final VoidCallback onToggleQueue;
+  final VoidCallback onToggleLyrics;
+  final VoidCallback? onToggleEqualizer;
+
+  /// Canvas panel (9:16 looping video, docked on the right edge). Output lives inside the More menu.
+  final VoidCallback? onToggleCanvas;
+  final bool queueActive;
+  final bool lyricsActive;
+  final bool equalizerActive;
+  final bool canvasActive;
+  final VoidCallback onToggleMini;
+
+  /// Fullscreen Now Playing overlay: one slim row with only the essentials
+  /// (like, transport, timeline, volume, queue, exit). The track identity is
+  /// already on the stage, so it is not repeated here.
+  final bool compact;
+  const WavePlayerDock({
+    super.key,
+    this.compact = false,
+    required this.onExpand,
+    required this.onToggleQueue,
+    required this.onToggleLyrics,
+    this.onToggleEqualizer,
+    this.onToggleCanvas,
+    this.queueActive = false,
+    this.lyricsActive = false,
+    this.equalizerActive = false,
+    this.canvasActive = false,
+    required this.onToggleMini,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final dark = waveIsDark(context);
+    // NOTE: position/duration/buffered/volume/speed deliberately excluded
+    // here so 1s ticks and volume drags never rebuild the whole dock.
+    // _DockProgress owns position; _VolumeSection owns volume; _DockOverflow
+    // owns speed/sleep. See perf audit.
+    final player = ref.watch(playbackServiceProvider.select((s) => (
+          current: s.current,
+          stream: s.stream,
+          shuffleEnabled: s.shuffleEnabled,
+          isPlaying: s.isPlaying,
+          repeatMode: s.repeatMode,
+        )));
+    final notifier = ref.read(playbackServiceProvider.notifier);
+    final current = player.current;
+    final artworkUrl = player.current?.artworkUrl ?? '';
+    final dockTint = ref.watch(artworkSeedProvider(artworkUrl)).valueOrNull;
+
+    final targetBase = () {
+      final baseColor = dark
+          ? waveDockTranslucent(context)
+          : waveSurface(context).withValues(alpha: 0.97);
+      if (dockTint != null && dark) {
+        return Color.lerp(baseColor, dockTint, 0.05) ?? baseColor;
+      }
+      return baseColor;
+    }();
+
+    return TweenAnimationBuilder<Color?>(
+      tween: ColorTween(begin: targetBase, end: targetBase),
+      duration: waveMotion(context, WaveMotion.normal),
+      curve: Curves.easeOutCubic,
+      builder: (context, animatedBase, child) {
+        // Floats over the page: frosted, so content scrolls behind it.
+        return WaveHaze(
+          level: NwHazeLevel.l1,
+          fillAlpha: 0.72,
+          enableBlur: true,
+          base: animatedBase ?? targetBase,
+          borderRadius:
+              compact ? BorderRadius.zero : BorderRadius.circular(999),
+          border: compact
+              ? Border(top: BorderSide(color: waveDivider(context)))
+              : Border.all(
+                  color: (dark ? Colors.white : Colors.black)
+                      .withValues(alpha: dark ? 0.16 : 0.14),
+                  width: 1.25,
+                ),
+          shadow: compact
+              ? null
+              : [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: dark ? 0.35 : 0.12),
+                    blurRadius: 24,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+          child: child!,
+        );
+      },
+      child: SizedBox(
+        height: compact ? _kCompactDockHeight : WaveDensity.dock,
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: compact ? 12 : 24),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              // Dock width is content width (already rail-aware) — never
+              // MediaQuery window width which overestimates by ~200px.
+              final dockW = constraints.maxWidth;
+              final narrow = dockW < 680;
+              if (compact) {
+                return _compactBar(
+                  dockW: dockW,
+                  narrow: narrow,
+                  current: current,
+                  isPlaying: player.isPlaying,
+                  notifier: notifier,
+                );
+              }
+              return Row(
+                children: [
+                  // LEFT — identity (290px, placeholder when idle).
+                  SizedBox(
+                    width: narrow ? 200 : 290,
+                    child: AnimatedSwitcher(
+                      duration: waveMotion(context, WaveMotion.normal),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, anim) => FadeTransition(
+                        opacity: anim,
+                        child: child,
+                      ),
+                      child: current == null
+                          ? _IdleIdentity(
+                              key: const ValueKey('idle'),
+                              onExpand: onExpand,
+                            )
+                          : KeyedSubtree(
+                              key: ValueKey(current.queueKey),
+                              child: Row(
+                                children: [
+                                  WaveA11yButton(
+                                    label: 'Open Now Playing',
+                                    onTap: onExpand,
+                                    child: MouseRegion(
+                                    cursor: SystemMouseCursors.click,
+                                    child: GestureDetector(
+                                    onTap: onExpand,
+                                    child: NWTooltip(
+                                      message: 'Open Now Playing',
+                                      child: WaveArtwork(
+                                        url: current.artworkUrl,
+                                        videoId: current.videoId,
+                                        size: 48,
+                                        radius: WaveRadius.artwork,
+                                        label: current.title,
+                                        title: current.title,
+                                        artist: current.artist,
+                                      ),
+                                    ),
+                                  ))),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Semantics(
+                                      button: true,
+                                      onTap: onExpand,
+                                      child: MouseRegion(
+                                      cursor: SystemMouseCursors.click,
+                                      child: GestureDetector(
+                                      onTap: onExpand,
+                                      child: Column(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            current.title,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style:
+                                                WaveType.trackTitle.copyWith(
+                                              fontSize: 13.5,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                          WaveArtistLine(
+                                            artist: current.artist,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: WaveType.meta.copyWith(
+                                              fontSize: 12,
+                                              color: dark
+                                                  ? WaveColors.textSecondary
+                                                  : WaveColors
+                                                      .lightTextSecondary,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    )))
+                                  ),
+                                  _LikeGlyph(track: current),
+                                  if (!narrow)
+                                    _Glyph(
+                                      tooltip: 'More',
+                                      icon: WaveIcons.more,
+                                      onTap: null,
+                                      menuItems: waveTrackMenuItems(
+                                        context: context,
+                                        ref: ref,
+                                        title: current.title,
+                                        artist: current.artist,
+                                        artworkUrl: current.artworkUrl,
+                                        videoId: current.videoId,
+                                        playable: current,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                    ),
+                  ),
+                  // CENTER — transport + timeline. No minWidth: squeezes
+                  // gracefully on tiny windows instead of overflowing.
+                  Expanded(
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          maxWidth: 560,
+                          minWidth: 0,
+                        ),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                _Glyph(
+                                  tooltip: 'Shuffle',
+                                  icon: WaveIcons.shuffle,
+                                  // Live rooms: off and dimmed (not just un-lit),
+                                  // since the host owns the queue order.
+                                  active: player.shuffleEnabled,
+                                  onTap: notifier.toggleShuffle,
+                                ),
+                                _Glyph(
+                                  tooltip: 'Previous',
+                                  icon: WaveIcons.previous,
+                                  large: true,
+                                  onTap: notifier.previous,
+                                ),
+                                RepaintBoundary(child: _PlayGlyph(
+                                  playing: player.isPlaying,
+                                  // Resuming is always allowed
+                                  enabled: current != null,
+                                  onTap: notifier.toggle,
+                                )),
+                                _Glyph(
+                                  tooltip: 'Next',
+                                  icon: WaveIcons.next,
+                                  large: true,
+                                  onTap: current == null
+                                      ? null
+                                      : notifier.next,
+                                ),
+                                _Glyph(
+                                  tooltip: 'Repeat ${player.repeatMode.name}',
+                                  icon: player.repeatMode ==
+                                          RepeatMode.one
+                                      ? WaveIcons.repeatOne
+                                      : WaveIcons.repeat,
+                                  active: player.repeatMode != RepeatMode.off,
+                                  onTap: notifier.cycleRepeat,
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 1),
+                            RepaintBoundary(
+                              child: _DockProgress(compact: narrow),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  // RIGHT — priority groups, never icon soup (spec §7–8).
+                  // HIGH: queue + volume + lyrics · MEDIUM: output ·
+                  // LOW: expand + mini + extras → overflow. No control ever
+                  // leaves the viewport; secondary actions collapse into More.
+                  Builder(builder: (context) {
+                    // Thresholds are dock-relative (content width), aligned
+                    // to canonical 900 breakpoint family.
+                    final showVolumeSlider = dockW >= 800;
+                    final showExpand = dockW >= 850;
+                    final showMini = dockW >= 950;
+                    return ConstrainedBox(
+                      constraints: BoxConstraints(
+                        minWidth: dockW < 560
+                            ? 110.0
+                            : dockW < 800
+                                ? 170.0
+                                : 260.0,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          _Glyph(
+                            tooltip: 'Queue',
+                            icon: WaveIcons.queue,
+                            active: queueActive,
+                            onTap: onToggleQueue,
+                          ),
+                          if (onToggleEqualizer != null)
+                            _Glyph(
+                              tooltip: 'Equalizer',
+                              icon: WaveIcons.equalizer,
+                              active: equalizerActive,
+                              onTap: onToggleEqualizer!,
+                            ),
+                          if (showVolumeSlider)
+                            const _VolumeSection()
+                          else
+                            const _VolumeFlyoutSection(),
+                          if (showExpand)
+                            _Glyph(
+                              tooltip: 'Now Playing',
+                              icon: WaveIcons.expand,
+                              onTap: onExpand,
+                            ),
+                          if (showMini)
+                            _Glyph(
+                              tooltip: 'Mini player',
+                              icon: WaveIcons.miniPlayer,
+                              onTap: onToggleMini,
+                            ),
+                          _DockOverflow(
+                            showOutputItem: true,
+                            showExpandItem: !showExpand,
+                            showMiniItem: !showMini,
+                            onExpand: onExpand,
+                            onToggleMini: onToggleMini,
+                          ),
+                        ],
+                      ),
+                    );
+                  }),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// The fullscreen overlay row. One line instead of the dock's two-row
+  /// centre: [like] [prev play next] [time ━━━ time] [volume] [queue] [exit].
+  /// Shuffle/repeat, quality, equalizer, canvas, mini player and the
+  /// More menu are left out; leaving fullscreen brings them all back.
+  Widget _compactBar({
+    required double dockW,
+    required bool narrow,
+    required PlayableTrack? current,
+    required bool isPlaying,
+    required PlaybackService notifier,
+  }) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 1100),
+        child: Row(
+          children: [
+            if (current != null) _LikeGlyph(track: current),
+            _Glyph(
+              tooltip:
+                  'Previous',
+              icon: WaveIcons.previous,
+              large: true,
+              onTap: current == null ? null : notifier.previous,
+            ),
+            RepaintBoundary(child: _PlayGlyph(
+              playing: isPlaying,
+              enabled: current != null && !(isPlaying),
+              onTap: notifier.toggle,
+            )),
+            _Glyph(
+              tooltip: 'Next',
+              icon: WaveIcons.next,
+              large: true,
+              onTap: current == null ? null : notifier.next,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: RepaintBoundary(child: _DockProgress(compact: narrow)),
+            ),
+            const SizedBox(width: 8),
+            if (dockW >= 700)
+              const _VolumeSection()
+            else
+              const _VolumeFlyoutSection(),
+            _Glyph(
+              tooltip: 'Queue',
+              icon: WaveIcons.queue,
+              active: queueActive,
+              onTap: onToggleQueue,
+            ),
+            _Glyph(
+              tooltip: 'Exit fullscreen (Esc)',
+              icon: WaveIcons.exitFullscreen,
+              onTap: onExpand,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Height of the fullscreen overlay dock ([WavePlayerDock.compact]).
+const double _kCompactDockHeight = 56;
+
+/// Placeholder identity — dock never collapses to zero height.
+class _IdleIdentity extends StatelessWidget {
+  final VoidCallback onExpand;
+  const _IdleIdentity({super.key, required this.onExpand});
+  @override
+  Widget build(BuildContext context) {
+    final dark = waveIsDark(context);
+    return Row(
+      children: [
+        const WaveArtwork(
+          url: '',
+          size: 56,
+          radius: WaveRadius.artwork,
+          label: 'Nothing playing',
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Nothing playing',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: WaveType.trackTitle.copyWith(fontSize: 13.5),
+              ),
+              Text(
+                'Pick something to start',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: WaveType.meta.copyWith(
+                  fontSize: 12,
+                  color: dark
+                      ? WaveColors.textTertiary
+                      : WaveColors.lightTextTertiary,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Devices for the More menu's Output submenu. The current device is tinted
+/// with the accent.
+List<WaveMenuEntry> _outputEntries(
+  BuildContext context,
+  WidgetRef ref,
+  AudioOutputState output,
+) {
+  final accent = waveAccent(context);
+  void select(String id) =>
+      ref.read(audioOutputProvider.notifier).selectDevice(id);
+  return [
+    WaveMenuAction(
+      leading: Icon(
+        WaveIcons.device,
+        size: 15,
+        color: output.selectedId.isEmpty ? accent : null,
+      ),
+      label: 'System default',
+      onPressed: () => select(''),
+    ),
+    for (final d in output.devices.take(8))
+      WaveMenuAction(
+        leading: Icon(
+          WaveIcons.device,
+          size: 15,
+          color: d.name == output.selectedId ? accent : null,
+        ),
+        label: d.description,
+        onPressed: () => select(d.name),
+      ),
+    const WaveMenuSeparator(),
+    WaveMenuAction(
+      leading: const Icon(WaveIcons.settings, size: 15),
+      label: 'Output settings',
+      onPressed: () => context.go('/settings?section=audio'),
+    ),
+  ];
+}
+
+/// Plain glyph button — no coloured square wrapping.
+class _Glyph extends StatefulWidget {
+  final String tooltip;
+  final IconData icon;
+  final bool active;
+  final bool large;
+  final VoidCallback? onTap;
+  final List<WaveMenuEntry>? menuItems;
+  const _Glyph({
+    required this.tooltip,
+    required this.icon,
+    this.active = false,
+    this.large = false,
+    this.onTap,
+    this.menuItems,
+  });
+  @override
+  State<_Glyph> createState() => _GlyphState();
+}
+
+class _GlyphState extends State<_Glyph> {
+  bool _hover = false;
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = waveIsDark(context);
+    final accent = waveAccent(context);
+    final disabled = widget.onTap == null && widget.menuItems == null;
+    final color = widget.active
+        ? accent
+        : disabled
+            ? (dark ? WaveColors.textTertiary : WaveColors.lightTextTertiary)
+                .withValues(alpha: 0.5)
+            : _hover
+                ? (dark
+                    ? WaveColors.textPrimary
+                    : WaveColors.lightTextPrimary)
+                : (dark
+                    ? WaveColors.textSecondary
+                    : WaveColors.lightTextSecondary);
+    Widget glyph = MouseRegion(
+      cursor: disabled ? SystemMouseCursors.basic : SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() {
+        _hover = false;
+        _pressed = false;
+      }),
+      child: GestureDetector(
+        onTapDown: disabled ? null : (_) => setState(() => _pressed = true),
+        onTapUp: disabled ? null : (_) => setState(() => _pressed = false),
+        onTapCancel: disabled ? null : () => setState(() => _pressed = false),
+        onTap: widget.onTap,
+        child: AnimatedScale(
+          scale: _pressed ? 0.90 : (_hover ? 1.10 : 1.0),
+          duration: waveMotion(context, WaveMotion.fast),
+          curve: Curves.easeOutCubic,
+          child: Container(
+            width: 34,
+            height: 34,
+            color: Colors.transparent,
+            // Transport icons 18px, utility glyphs 15px (canonical).
+            child: Icon(widget.icon,
+                size: widget.large ? 18 : 15, color: color),
+          ),
+        ),
+      ),
+    );
+    if (widget.menuItems != null) {
+      glyph = WaveMenuButton(
+        entries: widget.menuItems!,
+        placement: FlyoutPlacementMode.topRight,
+        buttonBuilder: (context, onOpen) => WaveA11yButton(
+          label: widget.tooltip,
+          onTap: onOpen,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.click,
+            onEnter: (_) => setState(() => _hover = true),
+            onExit: (_) => setState(() {
+              _hover = false;
+              _pressed = false;
+            }),
+            child: GestureDetector(
+              onTapDown: (_) => setState(() => _pressed = true),
+              onTapUp: (_) => setState(() => _pressed = false),
+              onTapCancel: () => setState(() => _pressed = false),
+              onTap: onOpen,
+              child: AnimatedScale(
+                scale: _pressed ? 0.90 : (_hover ? 1.10 : 1.0),
+                duration: waveMotion(context, WaveMotion.fast),
+                curve: Curves.easeOutCubic,
+                child: Container(
+                  width: 34,
+                  height: 34,
+                  color: Colors.transparent,
+                  child: Icon(widget.icon, size: 15, color: color),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    } else {
+      glyph = WaveA11yButton(
+        label: widget.tooltip,
+        selected: widget.active,
+        onTap: widget.onTap,
+        child: glyph,
+      );
+    }
+    return NWTooltip(message: widget.tooltip, child: glyph);
+  }
+}
+
+/// Fluent media transport button — 36px accent disc, NOT a giant FAB.
+///
+/// Uses the active [waveAccent] (NeoWave / System / Artwork accent) with
+/// contrast glyph, 1px tonal ring + restrained shadow. Hover 92%,
+/// pressed 85%, focus ring 2px, tooltip with shortcut. Both themes.
+class _PlayGlyph extends StatefulWidget {
+  final bool playing;
+  final bool enabled;
+  final VoidCallback onTap;
+  const _PlayGlyph({
+    required this.playing,
+    this.enabled = true,
+    required this.onTap,
+  });
+  @override
+  State<_PlayGlyph> createState() => _PlayGlyphState();
+}
+
+class _PlayGlyphState extends State<_PlayGlyph> {
+  bool _hover = false;
+  bool _pressed = false;
+  final FocusNode _focus = FocusNode();
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = waveIsDark(context);
+    final accent = waveAccent(context);
+    final onAccent = onAccentFor(accent);
+    Color bg;
+    if (!widget.enabled) {
+      bg = accent.withValues(alpha: 0.35);
+    } else if (_pressed) {
+      bg = accent.withValues(alpha: 0.82);
+    } else if (_hover) {
+      bg = accent.withValues(alpha: 0.93);
+    } else {
+      bg = accent;
+    }
+    final fg = widget.enabled
+        ? onAccent
+        : onAccent.withValues(alpha: 0.5);
+    return NWTooltip(
+      message: widget.playing ? 'Pause (Space)' : 'Play (Space)',
+      child: Semantics(
+        button: true,
+        enabled: widget.enabled,
+        label: widget.playing ? 'Pause' : 'Play',
+        onTap: widget.enabled ? widget.onTap : null,
+        excludeSemantics: true,
+        child: Focus(
+        focusNode: _focus,
+        onFocusChange: (_) => setState(() {}),
+        onKeyEvent: (node, event) {
+          // Space is owned by the global shell handler (always toggles
+          // playback, even when this glyph has focus). Enter still
+          // activates the focused glyph natively.
+          if (event is KeyDownEvent &&
+              event.logicalKey == LogicalKeyboardKey.enter) {
+            if (widget.enabled) widget.onTap();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: MouseRegion(
+          cursor: widget.enabled
+              ? SystemMouseCursors.click
+              : SystemMouseCursors.basic,
+          onEnter: (_) => setState(() => _hover = true),
+          onExit: (_) {
+            setState(() {
+              _hover = false;
+              _pressed = false;
+            });
+          },
+          child: GestureDetector(
+            onTapDown: (_) =>
+                setState(() => _pressed = true),
+            onTapUp: (_) =>
+                setState(() => _pressed = false),
+            onTapCancel: () =>
+                setState(() => _pressed = false),
+            onTap: widget.enabled ? widget.onTap : null,
+            child: AnimatedScale(
+              scale: _pressed ? 0.92 : (_hover ? 1.06 : 1.0),
+              duration: waveMotion(context, WaveMotion.fast),
+              curve: Curves.easeOutCubic,
+              child: AnimatedContainer(
+                duration: waveMotion(context, WaveMotion.fast),
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: bg,
+                  border: Border.all(
+                    color: (_focus.hasFocus
+                            ? accent
+                            : (dark
+                                ? Colors.white
+                                : Colors.black))
+                        .withValues(
+                            alpha: _focus.hasFocus ? 0.9 : 0.14),
+                    width: _focus.hasFocus ? 2 : 1,
+                  ),
+                  boxShadow: WaveElevation.transport(dark),
+                ),
+                // Buffering is watched here, not by the dock: mpv flips it
+                // around every seek (e.g. a lyric click), which used to
+                // rebuild the whole dock twice.
+                child: Center(
+                  child: Consumer(
+                    builder: (context, ref, _) {
+                      final buffering = ref.watch(
+                        playbackServiceProvider
+                            .select((s) => s.isBuffering),
+                      );
+                      return buffering
+                      ? SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: ProgressRing(
+                            strokeWidth: 2.5,
+                            activeColor: fg,
+                            backgroundColor:
+                                fg.withValues(alpha: 0.25),
+                          ),
+                        )
+                      : AnimatedSwitcher(
+                          duration: waveMotion(
+                              context, const Duration(milliseconds: 180)),
+                          transitionBuilder: (child, animation) =>
+                              ScaleTransition(
+                            scale: CurvedAnimation(
+                              parent: animation,
+                              curve: Curves.easeOutBack,
+                            ),
+                            child: FadeTransition(
+                              opacity: animation,
+                              child: child,
+                            ),
+                          ),
+                          child: Icon(
+                            widget.playing
+                                ? WaveIcons.pause
+                                : WaveIcons.play,
+                            key: ValueKey(widget.playing),
+                            size: 15,
+                            color: fg,
+                          ),
+                        );
+                    },
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+      ),
+    );
+  }
+}
+
+/// Position scope boundary: ONLY this widget subscribes to the 1s
+/// position/buffered/duration stream. Thin 3px bar at rest with a small
+/// thumb; hover enlarges the interaction region and shows a timestamp
+/// via tooltip overlay (never clipped by the 80px dock); drag/click seeks;
+/// ←/→ keys seek ±5s (Shift ±15s) when focused.
+class _DockProgress extends ConsumerStatefulWidget {
+  final bool compact;
+  const _DockProgress({this.compact = false});
+  @override
+  ConsumerState<_DockProgress> createState() => _DockProgressState();
+}
+
+class _DockProgressState extends ConsumerState<_DockProgress> {
+  final FocusNode _focus = FocusNode();
+  final GlobalKey _barKey = GlobalKey();
+  double? _hoverRatio;
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
+  String _fmt(Duration d) {
+    final m = d.inMinutes;
+    final s = d.inSeconds % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  void _seekBy(Duration base, Duration total, int seconds) {
+    // No total means nothing to seek along: a step would clamp to zero and
+    // yank a playing track back to the start.
+    if (total <= Duration.zero) return;
+    final target = base + Duration(seconds: seconds);
+    final clamped = target.isNegative
+        ? Duration.zero
+        : (target > total ? total : target);
+    ref.read(playbackServiceProvider.notifier).seek(clamped);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = waveIsDark(context);
+    final accent = waveAccent(context);
+    final clock = ref.watch(playbackServiceProvider.select((s) => (
+          position: s.position,
+          buffered: s.buffered,
+          duration: s.duration,
+        )));
+    final notifier = ref.read(playbackServiceProvider.notifier);
+
+    final timeStyle = WaveType.meta.copyWith(
+      fontSize: 11,
+      fontFeatures: const [FontFeature.tabularFigures()],
+      color: dark ? WaveColors.textTertiary : WaveColors.lightTextTertiary,
+    );
+    final totalMs = clock.duration.inMilliseconds;
+    // mpv reports no duration until the source is open — a restored session
+    // or a freshly-resolved stream sits at zero for a beat. Printing that as
+    // "0:00" claimed a zero-length track and pinned the thumb to the start.
+    final hasDuration = totalMs > 0;
+    final hoverLabel = _hoverRatio == null || !hasDuration
+        ? null
+        : _fmt(Duration(
+            milliseconds: (_hoverRatio! * totalMs).round()));
+    // Compact windows hide timestamps so the timeline never overflows;
+    // the hover tooltip still announces the seek target.
+    final showTimes = !widget.compact;
+    return Row(
+      children: [
+        if (showTimes)
+          SizedBox(
+            width: 38,
+            child: Text(_fmt(clock.position),
+                textAlign: TextAlign.right, style: timeStyle),
+          ),
+        if (showTimes) const SizedBox(width: 8),
+        Expanded(
+          child: Focus(
+            focusNode: _focus,
+            onKeyEvent: (_, e) {
+              if (e is! KeyDownEvent) return KeyEventResult.ignored;
+              final shift = HardwareKeyboard.instance.logicalKeysPressed
+                  .contains(LogicalKeyboardKey.shiftLeft) ||
+                  HardwareKeyboard.instance.logicalKeysPressed
+                      .contains(LogicalKeyboardKey.shiftRight);
+              final step = shift ? 15 : 5;
+              if (
+                  (e.logicalKey == LogicalKeyboardKey.arrowRight ||
+                      e.logicalKey == LogicalKeyboardKey.arrowLeft)) {
+                return KeyEventResult.handled;
+              }
+              if (e.logicalKey == LogicalKeyboardKey.arrowRight) {
+                _seekBy(clock.position, clock.duration, step);
+                return KeyEventResult.handled;
+              }
+              if (e.logicalKey == LogicalKeyboardKey.arrowLeft) {
+                _seekBy(clock.position, clock.duration, -step);
+                return KeyEventResult.handled;
+              }
+              return KeyEventResult.ignored;
+            },
+            child: NWTooltip(
+              message: hoverLabel ??
+                  (hasDuration ? 'Seek (←/→ ±5s)' : 'Waiting for the stream'),
+              child: MouseRegion(
+                cursor: hasDuration
+                        ? SystemMouseCursors.click
+                        : SystemMouseCursors.basic,
+                onExit: (_) =>
+                    setState(() => _hoverRatio = null),
+                onHover: (e) {
+                  final box = _barKey.currentContext
+                      ?.findRenderObject() as RenderBox?;
+                  if (box == null || !box.hasSize) return;
+                  final ratio = (e.localPosition.dx / box.size.width)
+                      .clamp(0.0, 1.0);
+                  // Debounced: only rebuild on meaningful movement.
+                  if ((ratio - (_hoverRatio ?? -1)).abs() > 0.01) {
+                    setState(() => _hoverRatio = ratio);
+                  }
+                },
+                child: GestureDetector(
+                  onTapDown: (_) => _focus.requestFocus(),
+                  behavior: HitTestBehavior.translucent,
+                  child: Container(
+                    key: _barKey,
+                    // Larger interaction region without visibly bloating
+                    // the bar: transparent padding.
+                    padding:
+                        const EdgeInsets.symmetric(vertical: 7),
+                    color: Colors.transparent,
+                    child: Opacity(
+                      // Dimmed + thumbless: reads as disabled, not draggable.
+                      opacity: 1,
+                      child: RepaintBoundary(
+                      child: avp.ProgressBar(
+                              progress: clock.position,
+                              buffered: clock.buffered,
+                              total: clock.duration,
+                              onSeek: notifier.seek,
+                              barHeight: 3,
+                              thumbRadius: hasDuration ? 5 : 0,
+                              thumbColor: dark ? Colors.white : Colors.black,
+                              thumbGlowColor:
+                                  accent.withValues(alpha: 0.25),
+                              progressBarColor:
+                                  dark ? Colors.white : Colors.black,
+                              bufferedBarColor:
+                                  (dark ? Colors.white : Colors.black)
+                                      .withValues(alpha: 0.18),
+                              baseBarColor:
+                                  (dark ? Colors.white : Colors.black)
+                                      .withValues(alpha: 0.12),
+                              timeLabelLocation: avp.TimeLabelLocation.none,
+                            ),
+                    ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        if (showTimes) const SizedBox(width: 8),
+        if (showTimes)
+          SizedBox(
+            width: 38,
+            child: Text(hasDuration ? _fmt(clock.duration) : '--:--',
+                style: timeStyle),
+          ),
+      ],
+    );
+  }
+}
+
+class _LikeGlyph extends ConsumerStatefulWidget {
+  final PlayableTrack track;
+  const _LikeGlyph({required this.track});
+
+  @override
+  ConsumerState<_LikeGlyph> createState() => _LikeGlyphState();
+}
+
+class _LikeGlyphState extends ConsumerState<_LikeGlyph>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _anim;
+
+  @override
+  void initState() {
+    super.initState();
+    _anim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 220),
+      lowerBound: 0.8,
+      upperBound: 1.25,
+      value: 1.0,
+    );
+  }
+
+  @override
+  void dispose() {
+    _anim.dispose();
+    super.dispose();
+  }
+
+  void _onToggle() {
+    final liked = ref
+        .read(playlistRepositoryProvider.notifier)
+        .likedKeys()
+        .contains(widget.track.queueKey);
+    // Pop only on like: 1.0 → 1.25 eased out, then settle to 1.0 with a
+    // slight overshoot bounce. Settle is mounted-guarded so a track change
+    // mid-pop can't drive a disposed controller. Reduce motion keeps the
+    // glyph at rest: the fill change still lands on the same frame.
+    if (!liked && !waveReduceMotion(context)) {
+      _anim
+          .animateTo(1.25,
+              duration: const Duration(milliseconds: 110),
+              curve: Curves.easeOut)
+          .then((_) => mounted
+              ? _anim.animateTo(1.0,
+                  duration: const Duration(milliseconds: 130),
+                  curve: Curves.easeOutBack)
+              : null);
+    }
+    ref.read(playlistRepositoryProvider.notifier).toggleLiked(
+          StoredTrack(
+            name: widget.track.title,
+            artist: widget.track.artist,
+            artworkUrl: widget.track.artworkUrl,
+            videoId: widget.track.videoId,
+            album: widget.track.album,
+            durationSeconds: widget.track.duration.inSeconds,
+          ),
+        );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Watch the playlist STATE (not the notifier — its identity never
+    // changes, so watching it never rebuilds and the glyph sticks).
+    // `select` to a bool: only a flip of THIS track's liked state rebuilds,
+    // and the scan exits on the first hit instead of building a key list.
+    final key = widget.track.queueKey;
+    final liked = ref.watch(playlistRepositoryProvider.select((lists) {
+      for (final p in lists) {
+        if (!p.isLikedSongs) continue;
+        for (final t in p.tracks) {
+          if ('${t.name.toLowerCase()}|${t.artist.toLowerCase()}' == key) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }));
+    return ScaleTransition(
+      scale: _anim,
+      child: _Glyph(
+        tooltip: liked ? 'Unlike' : 'Like',
+        icon: liked ? WaveIcons.likedFill : WaveIcons.liked,
+        active: liked,
+        onTap: _onToggle,
+      ),
+    );
+  }
+}
+
+/// Isolated volume section — owns the volume select so drags never rebuild
+/// the whole dock (perf audit).
+class _VolumeSection extends ConsumerWidget {
+  const _VolumeSection();
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final volume =
+        ref.watch(playbackServiceProvider.select((s) => s.volume));
+    final output = ref.read(audioOutputProvider.notifier);
+    return _VolumeGlyph(
+      volume: volume,
+      onMute: output.toggleMute,
+      onVolume: output.setVolume,
+    );
+  }
+}
+
+/// Isolated collapsed-volume section with a real slider in the flyout.
+class _VolumeFlyoutSection extends ConsumerWidget {
+  const _VolumeFlyoutSection();
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final volume =
+        ref.watch(playbackServiceProvider.select((s) => s.volume));
+    final output = ref.read(audioOutputProvider.notifier);
+    return _VolumeFlyoutGlyph(
+      volume: volume,
+      onMute: output.toggleMute,
+      onVolume: output.setVolume,
+    );
+  }
+}
+
+/// Fluent volume: mute glyph + 84px thin slider with percentage tooltip.
+/// Keyboard arrows supported via [NWVolumeSlider] focus.
+class _VolumeGlyph extends StatelessWidget {
+  final double volume;
+  final VoidCallback onMute;
+  final ValueChanged<double> onVolume;
+  const _VolumeGlyph({
+    required this.volume,
+    required this.onMute,
+    required this.onVolume,
+  });
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _Glyph(
+          tooltip: volume == 0
+              ? 'Unmute'
+              : 'Mute (${(volume * 100).round()}%)',
+          icon: volume == 0
+              ? WaveIcons.volumeMute
+              : WaveIcons.volume,
+          onTap: onMute,
+        ),
+        NWTooltip(
+          message: '${(volume * 100).round()}%',
+          child: NWVolumeSlider(
+            value: volume.clamp(0.0, 1.0),
+            onChanged: onVolume,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Collapsed volume: glyph opens a Fluent flyout WITH a real slider
+/// so volume stays adjustable below 1050px.
+class _VolumeFlyoutGlyph extends ConsumerStatefulWidget {
+  final double volume;
+  final VoidCallback onMute;
+  final ValueChanged<double> onVolume;
+  const _VolumeFlyoutGlyph({
+    required this.volume,
+    required this.onMute,
+    required this.onVolume,
+  });
+  @override
+  ConsumerState<_VolumeFlyoutGlyph> createState() =>
+      _VolumeFlyoutGlyphState();
+}
+
+class _VolumeFlyoutGlyphState extends ConsumerState<_VolumeFlyoutGlyph> {
+  final _controller = FlyoutController();
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final volume = widget.volume;
+    return FlyoutTarget(
+      controller: _controller,
+      child: NWTooltip(
+        message: 'Volume (${(volume * 100).round()}%)',
+        child: _Glyph(
+          tooltip: 'Volume',
+          icon: volume == 0
+              ? WaveIcons.volumeMute
+              : WaveIcons.volume,
+          onTap: () {
+            _controller.showFlyout(
+              barrierColor: Colors.transparent,
+              placementMode: FlyoutPlacementMode.topCenter,
+              transitionDuration: const Duration(milliseconds: 90),
+              transitionBuilder: fastFlyoutTransition,
+              builder: (context) => WaveFlyoutPanel.child(
+                maxWidth: 240,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Volume ${(volume * 100).round()}%',
+                        style: WaveType.label,
+                      ),
+                      const SizedBox(height: 8),
+                      NWVolumeSlider(
+                        value: volume.clamp(0.0, 1.0),
+                        onChanged: widget.onVolume,
+                      ),
+                      const SizedBox(height: 4),
+                      WaveLink(
+                        onPressed: () {
+                          widget.onMute();
+                          _controller.close();
+                        },
+                        child: Text(volume == 0 ? 'Unmute' : 'Mute',
+                            style: WaveType.label),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _DockOverflow extends ConsumerWidget {
+  final bool showOutputItem;
+  final bool showExpandItem;
+  final bool showMiniItem;
+  final VoidCallback onExpand;
+  final VoidCallback onToggleMini;
+  const _DockOverflow({
+    this.showOutputItem = false,
+    this.showExpandItem = false,
+    this.showMiniItem = false,
+    required this.onExpand,
+    required this.onToggleMini,
+  });
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final notifier = ref.read(playbackServiceProvider.notifier);
+    final sleep = ref.watch(
+      playbackServiceProvider.select((s) => s.sleepRemaining),
+    );
+    final sleepMinutes = ref.watch(
+      playbackServiceProvider.select((s) => s.sleepMinutes),
+    );
+    final speed =
+        ref.watch(playbackServiceProvider.select((s) => s.speed));
+    final speedLabel =
+        speed == speed.roundToDouble() ? '${speed.toInt()}' : '$speed';
+    final output = ref.watch(audioOutputProvider);
+    final outputName = output.selectedLabel;
+    final outputEntries = _outputEntries(context, ref, output);
+    final hasCollapsed =
+        showOutputItem ||
+        showExpandItem ||
+        showMiniItem;
+    return _Glyph(
+      tooltip: 'More',
+      icon: WaveIcons.more,
+      menuItems: [
+        // Collapsed priority controls reappear here — nothing is lost
+        // at narrow widths, nothing overflows the window.
+        if (showOutputItem)
+          WaveMenuSubmenu(
+            leading: const Icon(WaveIcons.speaker, size: 15),
+            label: 'Output · $outputName',
+            items: () => outputEntries,
+          ),
+        if (showExpandItem)
+          WaveMenuAction(
+            leading: const Icon(WaveIcons.expand, size: 15),
+            label: 'Open Now Playing',
+            onPressed: onExpand,
+          ),
+        if (showMiniItem)
+          WaveMenuAction(
+            leading:
+                const Icon(WaveIcons.miniPlayer, size: 15),
+            label: 'Mini player',
+            onPressed: onToggleMini,
+          ),
+        if (hasCollapsed) const WaveMenuSeparator(),
+        WaveMenuAction(
+          leading: const Icon(WaveIcons.gauge, size: 15),
+          label: 'Speed $speedLabel×',
+          onPressed: notifier.cycleSpeed,
+        ),
+        WaveMenuSubmenu(
+          leading: const Icon(WaveIcons.clock, size: 15),
+          label: _sleepLabel(sleep),
+          items: () => [
+            WaveMenuAction(
+              leading: _sleepMark(sleepMinutes == null),
+              label: 'Off',
+              onPressed: () => notifier.setSleepTimer(null),
+            ),
+            for (final minutes in _sleepPresets)
+              WaveMenuAction(
+                leading: _sleepMark(sleepMinutes == minutes),
+                label: '$minutes minutes',
+                onPressed: () =>
+                    notifier.setSleepTimer(Duration(minutes: minutes)),
+              ),
+            WaveMenuAction(
+              leading: _sleepMark(sleepMinutes != null &&
+                  !_sleepPresets.contains(sleepMinutes)),
+              label: 'Custom…',
+              onPressed: () => _showCustomSleepDialog(context, notifier),
+            ),
+          ],
+        ),
+        WaveMenuAction(
+          leading: const Icon(WaveIcons.downloadAction, size: 15),
+          label: 'Download this track',
+          onPressed: () {
+            final current =
+                ref.read(playbackServiceProvider).current;
+            if (current == null) return;
+            ref.read(downloadManagerProvider.notifier).downloadTrack(
+                  title: current.title,
+                  artist: current.artist,
+                  album: current.album,
+                  artworkUrl: current.artworkUrl,
+                );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+const _sleepPresets = [15, 30, 60];
+
+Widget _sleepMark(bool on) => on
+    ? const Icon(FluentIcons.check_mark, size: 13)
+    : const SizedBox(width: 13);
+
+/// "Sleep timer" while off, otherwise the time left as "Sleep · m:ss".
+String _sleepLabel(Duration? remaining) {
+  if (remaining == null) return 'Sleep timer';
+  final total = remaining.inSeconds.clamp(0, 24 * 60 * 60);
+  final minutes = total ~/ 60;
+  final seconds = (total % 60).toString().padLeft(2, '0');
+  return 'Sleep · $minutes:$seconds';
+}
+
+Future<void> _showCustomSleepDialog(
+  BuildContext context,
+  PlaybackService notifier,
+) async {
+  final minutes = await showDialog<int>(
+    context: context,
+    builder: (context) => const _CustomSleepDialog(),
+  );
+  if (minutes == null) return;
+  notifier.setSleepTimer(Duration(minutes: minutes));
+}
+
+/// Owns its text controller so it is disposed with the dialog, not while
+/// the close animation is still drawing it.
+class _CustomSleepDialog extends StatefulWidget {
+  const _CustomSleepDialog();
+
+  @override
+  State<_CustomSleepDialog> createState() => _CustomSleepDialogState();
+}
+
+class _CustomSleepDialogState extends State<_CustomSleepDialog> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _start() {
+    final n = int.tryParse(_controller.text.trim());
+    if (n == null || n < 1 || n > 1440) return;
+    Navigator.of(context).pop(n);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ContentDialog(
+      title: const Text('Sleep timer'),
+      constraints: const BoxConstraints(maxWidth: 420),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Minutes', style: WaveType.trackTitle),
+          const SizedBox(height: 6),
+          TextBox(
+            controller: _controller,
+            placeholder: '45',
+            decoration: waveInputDecoration(context), foregroundDecoration: waveInputForegroundDecoration(context), textAlignVertical: TextAlignVertical.center,
+            autofocus: true,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            onSubmitted: (_) => _start(),
+          ),
+          const SizedBox(height: 6),
+          Text('1–1440. Replaces the current timer.', style: WaveType.meta),
+        ],
+      ),
+      actions: [
+        Button(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _start,
+          child: const Text('Start'),
+        ),
+      ],
+    );
+  }
+}
+
