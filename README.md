@@ -1,4 +1,4 @@
-# NeoWave
+# <img src="assets/brand/NeoWave-rounded.png" alt="" width="64" height="64" align="center" /> NeoWave
 
 A desktop music player for YouTube Music, with word-synced lyrics and Last.fm scrobbling. Built with Flutter for Windows and Linux.
 
