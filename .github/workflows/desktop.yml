@@ -2,16 +2,16 @@ name: Build and Release Desktop Apps
 
 on:
   push:
-    branches:
-      - main
+    # branches:
+    #   - main
     tags:
       - "v*"
     paths-ignore:
       - '**.md'
       - '**.yml'
   pull_request:
-    branches:
-      - main
+    # branches:
+    #   - main
     paths-ignore:
       - '**.md'
       - '**.yml'
